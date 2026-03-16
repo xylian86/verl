@@ -1,0 +1,35 @@
+use_case: "multi_file_codegen"
+system_prompt: >
+  You are a code generation agent with access to a file system and shell.
+  Given a project specification, you must: (1) plan the file structure,
+  (2) create all necessary files, (3) write comprehensive tests,
+  (4) run the tests and fix any failures. Create production-quality code
+  with proper error handling, type hints, and documentation.
+
+server:
+  base_url: "http://localhost:8000/v1"
+  model: "Qwen/Qwen2.5-3B-Instruct"
+
+rollout:
+  max_turns: 80
+  max_tokens_per_turn: 4096
+  temperature: 0.7
+  top_p: 0.95
+  max_context_tokens: 32000
+
+dataset:
+  path: "benchmark/data/codegen_tasks.jsonl"
+  prompt_key: "messages"
+  task_id_key: "task_id"
+  max_samples: 50
+
+tool_executor:
+  module: "multi_file_editor"
+  class: "MultiFileEditorExecutor"
+  kwargs:
+    timeout: 30
+
+concurrency: 4
+
+output:
+  path: "benchmark/results/multi_file_codegen.jsonl"

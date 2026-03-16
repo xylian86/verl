@@ -1,0 +1,35 @@
+use_case: "nl2sql_complex"
+system_prompt: >
+  You are a SQL expert working with an enterprise database. You have access to tools
+  for executing SQL queries, listing tables, describing table schemas, and running
+  Python for data analysis. Given a natural language question, explore the database
+  schema, understand the data, write and refine SQL queries iteratively, and provide
+  a clear answer. For complex questions, break them into sub-queries.
+
+server:
+  base_url: "http://localhost:8000/v1"
+  model: "Qwen/Qwen2.5-3B-Instruct"
+
+rollout:
+  max_turns: 30
+  max_tokens_per_turn: 2048
+  temperature: 0.7
+  top_p: 0.95
+  max_context_tokens: 32000
+
+dataset:
+  path: "benchmark/data/nl2sql_prompts.jsonl"
+  prompt_key: "messages"
+  task_id_key: "task_id"
+  max_samples: 50
+
+tool_executor:
+  module: "sqlite_executor"
+  class: "SQLiteExecutor"
+  kwargs:
+    db_path: "benchmark/data/enterprise.db"
+
+concurrency: 8
+
+output:
+  path: "benchmark/results/nl2sql_complex.jsonl"

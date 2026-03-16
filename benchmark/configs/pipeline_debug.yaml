@@ -1,0 +1,36 @@
+use_case: "pipeline_debug"
+system_prompt: >
+  You are a data pipeline debugging agent working with an enterprise database.
+  You have access to SQL execution, table schema inspection, and Python for analysis.
+  Given a data quality issue or pipeline bug, systematically investigate:
+  (1) understand the expected behavior, (2) examine the data for anomalies,
+  (3) trace the root cause, (4) propose and test a fix, (5) verify the fix resolves
+  the issue. Write and execute diagnostic queries throughout your investigation.
+
+server:
+  base_url: "http://localhost:8000/v1"
+  model: "Qwen/Qwen2.5-3B-Instruct"
+
+rollout:
+  max_turns: 35
+  max_tokens_per_turn: 2048
+  temperature: 0.7
+  top_p: 0.95
+  max_context_tokens: 32000
+
+dataset:
+  path: "benchmark/data/pipeline_debug_prompts.jsonl"
+  prompt_key: "messages"
+  task_id_key: "task_id"
+  max_samples: 50
+
+tool_executor:
+  module: "sqlite_executor"
+  class: "SQLiteExecutor"
+  kwargs:
+    db_path: "benchmark/data/enterprise.db"
+
+concurrency: 8
+
+output:
+  path: "benchmark/results/pipeline_debug.jsonl"
