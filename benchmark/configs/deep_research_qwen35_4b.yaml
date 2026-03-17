@@ -1,0 +1,38 @@
+use_case: "deep_research"
+system_prompt: >
+  You are a deep research agent with access to web search and page reading tools.
+  Given a research question, you must: (1) search for information from multiple angles,
+  (2) read at least 10 web pages, (3) take notes on key findings, (4) cross-reference
+  claims across sources, and (5) produce a comprehensive report with citations.
+  Be thorough — explore follow-up questions that arise during research.
+
+server:
+  base_url: "http://localhost:8000/v1"
+  model: "Qwen/Qwen3.5-4B"
+
+rollout:
+  max_turns: 256
+  max_tokens_per_turn: 65536
+  temperature: 1.0
+  top_p: 0.95
+  max_context_tokens: 262144
+
+dataset:
+  path: "benchmark/data/research_tasks_real.jsonl"
+  prompt_key: "messages"
+  task_id_key: "task_id"
+  max_samples: 64
+
+tool_executor:
+  module: "real_search"
+  class: "RealSearchExecutor"
+  kwargs:
+    max_results: 100
+    max_page_chars: 65536
+    timeout: 40
+
+num_rollouts: 8
+concurrency: 128
+
+output:
+  path: "benchmark/results/deep_research_qwen35-4b.jsonl"

@@ -7,20 +7,20 @@ system_prompt: >
 
 server:
   base_url: "http://localhost:8000/v1"
-  model: "Qwen/Qwen2.5-3B-Instruct"
+  model: "Qwen3-30B-A3B-Thinking-2507"
 
 rollout:
-  max_turns: 60
-  max_tokens_per_turn: 2048
+  max_turns: 128
+  max_tokens_per_turn: 32768
   temperature: 0.7
   top_p: 0.95
-  max_context_tokens: 32000
+  max_context_tokens: 262144
 
 dataset:
   path: "benchmark/data/swe_bench.jsonl"
   prompt_key: "messages"
   task_id_key: "task_id"
-  max_samples: 50
+  max_samples: 64
 
 tool_executor:
   module: "bash_executor"
@@ -28,7 +28,9 @@ tool_executor:
   kwargs:
     timeout: 30
 
-concurrency: 8
+num_rollouts: 8
+concurrency: 64
+save_traces: false
 
 output:
-  path: "benchmark/results/swe_agent.jsonl"
+  path: "benchmark/results/swe_agent_thinking.jsonl"

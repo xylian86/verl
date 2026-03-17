@@ -29,6 +29,8 @@ from datetime import datetime, timedelta
 
 def create_enterprise_db(db_path: str, seed: int = 42):
     rng = random.Random(seed)
+    if os.path.exists(db_path):
+        os.remove(db_path)
     conn = sqlite3.connect(db_path)
     c = conn.cursor()
 

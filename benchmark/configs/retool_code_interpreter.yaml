@@ -7,14 +7,14 @@ system_prompt: >
 
 server:
   base_url: "http://localhost:8000/v1"
-  model: "Qwen/Qwen2.5-3B-Instruct"
+  model: "Qwen3-30B-A3B-Instruct-2507"
 
 rollout:
-  max_turns: 25
-  max_tokens_per_turn: 2048
+  max_turns: 128
+  max_tokens_per_turn: 4096
   temperature: 0.7
   top_p: 0.95
-  max_context_tokens: 32000
+  max_context_tokens: 262144
 
 dataset:
   path: "benchmark/data/numina_math.jsonl"
@@ -28,6 +28,7 @@ tool_executor:
   kwargs:
     timeout: 30
 
+num_rollouts: 8
 concurrency: 8
 
 output:

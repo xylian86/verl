@@ -40,6 +40,9 @@ class TurnRecord:
     cumulative_tokens: int
     finish_reason: str | None = None
     tool_calls_count: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    reasoning_tokens: int = 0
 
 
 @dataclass
@@ -48,9 +51,13 @@ class TrajectoryRecord:
     use_case: str
     turns: list[TurnRecord] = field(default_factory=list)
     total_tokens: int = 0
+    total_prompt_tokens: int = 0
+    total_completion_tokens: int = 0
+    total_reasoning_tokens: int = 0
     total_turns: int = 0
     finish_reason: str = ""  # "max_turns", "no_tool_call", "context_limit", "error"
     wall_time_s: float = 0.0
+    messages: list[dict] = field(default_factory=list)
 
 
 def count_tokens(text: str, encoding) -> int:
@@ -82,13 +89,14 @@ class MultiTurnDriver:
         self.max_tokens_per_turn = config["rollout"]["max_tokens_per_turn"]
         self.temperature = config["rollout"].get("temperature", 0.7)
         self.top_p = config["rollout"].get("top_p", 0.95)
-        self.max_context_tokens = config["rollout"].get("max_context_tokens", 32000)
-        self.concurrency = config.get("concurrency", 8)
+        self.max_context_tokens = config["rollout"].get("max_context_tokens", 131072)
+        self.concurrency = config.get("concurrency", 1)
+        self.num_rollouts = config.get("num_rollouts", 1)
         self.output_path = config["output"]["path"]
 
         # Load tool executor
         executor_cfg = config["tool_executor"]
-        module = importlib.import_module(f"rollout_driver.tool_executors.{executor_cfg['module']}")
+        module = importlib.import_module(f"benchmark.rollout_driver.tool_executors.{executor_cfg['module']}")
         executor_cls = getattr(module, executor_cfg["class"])
         self.executor = executor_cls(**executor_cfg.get("kwargs", {}))
 
@@ -135,7 +143,15 @@ class MultiTurnDriver:
                 choice = response.choices[0]
                 assistant_msg = choice.message
 
-                # Count assistant tokens
+                # Use server-reported usage when available (accounts for reasoning tokens)
+                usage = response.usage
+                prompt_tokens = usage.prompt_tokens if usage else 0
+                completion_tokens = usage.completion_tokens if usage else 0
+                reasoning_tokens = 0
+                if usage and hasattr(usage, "completion_tokens_details") and usage.completion_tokens_details:
+                    reasoning_tokens = getattr(usage.completion_tokens_details, "reasoning_tokens", 0) or 0
+
+                # Fallback: estimate tokens from content when usage unavailable
                 assistant_content = assistant_msg.content or ""
                 assistant_tokens = count_tokens(assistant_content, self.encoding)
                 if assistant_msg.tool_calls:
@@ -145,7 +161,14 @@ class MultiTurnDriver:
                             self.encoding,
                         )
 
-                cumulative_tokens += assistant_tokens
+                if usage:
+                    cumulative_tokens = prompt_tokens + completion_tokens
+                else:
+                    cumulative_tokens += assistant_tokens
+
+                record.total_prompt_tokens += prompt_tokens
+                record.total_completion_tokens += completion_tokens
+                record.total_reasoning_tokens += reasoning_tokens
                 n_tool_calls = len(assistant_msg.tool_calls) if assistant_msg.tool_calls else 0
 
                 record.turns.append(
@@ -156,7 +179,18 @@ class MultiTurnDriver:
                         cumulative_tokens=cumulative_tokens,
                         finish_reason=choice.finish_reason,
                         tool_calls_count=n_tool_calls,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        reasoning_tokens=reasoning_tokens,
                     )
+                )
+
+                print(
+                    f"    [{task_id}] turn {turn}: "
+                    f"prompt={prompt_tokens} completion={completion_tokens} "
+                    f"reasoning={reasoning_tokens} cumulative={cumulative_tokens} "
+                    f"tool_calls={n_tool_calls} finish={choice.finish_reason}",
+                    flush=True,
                 )
 
                 # Build assistant message dict
@@ -218,18 +252,44 @@ class MultiTurnDriver:
         record.total_tokens = cumulative_tokens
         record.total_turns = turn
         record.wall_time_s = time.time() - start_time
+        record.messages = messages
         return record
 
     async def run_all(self, tasks: list[dict]) -> list[TrajectoryRecord]:
-        """Run all tasks with bounded concurrency."""
+        """Run all tasks with bounded concurrency, repeating each task num_rollouts times."""
         semaphore = asyncio.Semaphore(self.concurrency)
-        results = []
+        completed = {"count": 0}
+        start_time = time.time()
+
+        expanded_tasks = []
+        for task in tasks:
+            for rollout_idx in range(self.num_rollouts):
+                t = dict(task)
+                t["task_id"] = f"{task.get('task_id', 'unknown')}_r{rollout_idx}"
+                expanded_tasks.append(t)
+
+        total = len(expanded_tasks)
 
         async def bounded_run(task):
             async with semaphore:
-                return await self.run_single_trajectory(task)
+                result = await self.run_single_trajectory(task)
+                completed["count"] += 1
+                elapsed = time.time() - start_time
+                avg = elapsed / completed["count"]
+                eta = avg * (total - completed["count"])
+                print(
+                    f"  [{completed['count']}/{total}] "
+                    f"task={task['task_id']} "
+                    f"turns={result.total_turns} "
+                    f"tokens={result.total_tokens} "
+                    f"reason={result.finish_reason} "
+                    f"time={result.wall_time_s:.1f}s "
+                    f"(elapsed={elapsed:.0f}s, ETA={eta:.0f}s)",
+                    flush=True,
+                )
+                return result
 
-        coros = [bounded_run(t) for t in tasks]
+        coros = [bounded_run(t) for t in expanded_tasks]
         results = await asyncio.gather(*coros, return_exceptions=True)
 
         records = []
@@ -247,13 +307,31 @@ class MultiTurnDriver:
         return records
 
     def save_results(self, records: list[TrajectoryRecord]):
-        """Save results to JSONL."""
+        """Save results to JSONL (stats) and optionally a separate traces file."""
         os.makedirs(os.path.dirname(self.output_path), exist_ok=True)
+
         with open(self.output_path, "w") as f:
             for rec in records:
                 d = asdict(rec)
+                d.pop("messages", None)
                 f.write(json.dumps(d) + "\n")
         print(f"Saved {len(records)} trajectories to {self.output_path}")
+
+        if self.config.get("save_traces", True):
+            traces_path = self.output_path.replace(".jsonl", "_traces.jsonl")
+            with open(traces_path, "w") as f:
+                for rec in records:
+                    trace = {
+                        "task_id": rec.task_id,
+                        "use_case": rec.use_case,
+                        "total_tokens": rec.total_tokens,
+                        "total_turns": rec.total_turns,
+                        "finish_reason": rec.finish_reason,
+                        "wall_time_s": rec.wall_time_s,
+                        "messages": rec.messages,
+                    }
+                    f.write(json.dumps(trace) + "\n")
+            print(f"Saved {len(records)} full traces to {traces_path}")
 
 
 def load_tasks(config: dict) -> list[dict]:
@@ -302,14 +380,18 @@ def load_tasks(config: dict) -> list[dict]:
 async def main_async(config_path: str):
     with open(config_path) as f:
         config = yaml.safe_load(f)
+    await main_async_from_config(config)
 
+
+async def main_async_from_config(config: dict):
     print(f"=== Running use case: {config['use_case']} ===")
     print(f"Max turns: {config['rollout']['max_turns']}")
     print(f"Max tokens/turn: {config['rollout']['max_tokens_per_turn']}")
-    print(f"Max context tokens: {config['rollout'].get('max_context_tokens', 32000)}")
+    print(f"Max context tokens: {config['rollout'].get('max_context_tokens', 131072)}")
+    print(f"Num rollouts per task: {config.get('num_rollouts', 1)}")
 
     tasks = load_tasks(config)
-    print(f"Loaded {len(tasks)} tasks")
+    print(f"Loaded {len(tasks)} tasks ({len(tasks) * config.get('num_rollouts', 1)} total trajectories)")
 
     driver = MultiTurnDriver(config)
     records = await driver.run_all(tasks)
@@ -320,12 +402,17 @@ async def main_async(config_path: str):
     if total_tokens_list:
         import statistics
 
+        reasoning_list = [r.total_reasoning_tokens for r in records]
+
         print(f"\n--- Summary for {config['use_case']} ---")
         print(f"Tasks: {len(records)}")
         print(f"Mean tokens: {statistics.mean(total_tokens_list):.0f}")
         print(f"Median tokens: {statistics.median(total_tokens_list):.0f}")
         print(f"Max tokens: {max(total_tokens_list)}")
         print(f"Min tokens: {min(total_tokens_list)}")
+        if any(r > 0 for r in reasoning_list):
+            print(f"Mean reasoning tokens: {statistics.mean(reasoning_list):.0f}")
+            print(f"Max reasoning tokens: {max(reasoning_list)}")
         finish_reasons = {}
         for r in records:
             finish_reasons[r.finish_reason] = finish_reasons.get(r.finish_reason, 0) + 1
@@ -335,8 +422,25 @@ async def main_async(config_path: str):
 def main():
     parser = argparse.ArgumentParser(description="Multi-turn rollout driver")
     parser.add_argument("--config", required=True, help="Path to use case YAML config")
+    parser.add_argument("--max-samples", type=int, default=None, help="Override dataset.max_samples")
+    parser.add_argument("--num-rollouts", type=int, default=None, help="Override num_rollouts")
+    parser.add_argument("--concurrency", type=int, default=None, help="Override concurrency")
+    parser.add_argument("--no-traces", action="store_true", help="Skip saving full conversation traces")
     args = parser.parse_args()
-    asyncio.run(main_async(args.config))
+
+    with open(args.config) as f:
+        config = yaml.safe_load(f)
+
+    if args.max_samples is not None:
+        config["dataset"]["max_samples"] = args.max_samples
+    if args.num_rollouts is not None:
+        config["num_rollouts"] = args.num_rollouts
+    if args.concurrency is not None:
+        config["concurrency"] = args.concurrency
+    if args.no_traces:
+        config["save_traces"] = False
+
+    asyncio.run(main_async_from_config(config))
 
 
 if __name__ == "__main__":

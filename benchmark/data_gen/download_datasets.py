@@ -323,6 +323,258 @@ def _gen_synthetic_math_tasks(output_path: str, n: int):
     print(f"Saved {len(tasks)} synthetic math tasks to {output_path}")
 
 
+def download_research_data(output_path: str, max_samples: int = 50):
+    """Download real research tasks from FRAMES (multi-hop retrieval) and ELI5 (long-form research).
+
+    FRAMES provides 824 challenging multi-hop questions requiring 2-15 Wikipedia articles.
+    ELI5 provides open-ended "Explain Like I'm 5" questions that demand thorough research.
+    We mix both to get diverse research-style prompts.
+    """
+    tasks = []
+
+    # --- FRAMES: multi-hop retrieval questions ---
+    frames_count = 0
+    try:
+        from datasets import load_dataset
+
+        ds = load_dataset("google/frames-benchmark", split="test")
+        system_prompt = (
+            "You are a deep research agent with access to web search and page reading tools. "
+            "Given a research question, you must: (1) search for information from multiple angles, "
+            "(2) read at least 10 web pages, (3) take notes on key findings, (4) cross-reference "
+            "claims across sources, and (5) produce a comprehensive report with citations. "
+            "Be thorough — explore follow-up questions that arise during research."
+        )
+
+        for i, row in enumerate(ds):
+            if len(tasks) >= max_samples:
+                break
+            prompt = row.get("Prompt") or row.get("prompt") or row.get("question", "")
+            if not prompt:
+                continue
+            tasks.append({
+                "task_id": f"frames_{i:03d}",
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+            })
+            frames_count += 1
+    except Exception as e:
+        print(f"Could not download FRAMES: {e}")
+
+    # --- ELI5: long-form research questions (fill remaining slots) ---
+    eli5_count = 0
+    remaining = max_samples - len(tasks)
+    if remaining > 0:
+        try:
+            from datasets import load_dataset
+
+            ds = load_dataset("rexarski/eli5_category", split="validation")
+            system_prompt = (
+                "You are a deep research agent with access to web search and page reading tools. "
+                "Given a question, conduct thorough research: search from multiple angles, "
+                "read at least 10 web pages, take notes, cross-reference claims, and produce "
+                "a comprehensive, well-structured answer with citations."
+            )
+
+            # Filter to science/technology categories for more research-worthy questions
+            research_categories = {
+                "Biology", "Chemistry", "Earth Science", "Economics",
+                "Engineering", "Mathematics", "Physics", "Technology",
+            }
+
+            for i, row in enumerate(ds):
+                if eli5_count >= remaining:
+                    break
+                category = row.get("category", "")
+                if category not in research_categories:
+                    continue
+                title = row.get("title", "")
+                selftext = row.get("selftext", "")
+                question = title
+                if selftext and selftext.strip():
+                    question += f"\n\n{selftext.strip()}"
+                if not question.strip():
+                    continue
+                tasks.append({
+                    "task_id": f"eli5_{eli5_count:03d}",
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": question},
+                    ],
+                })
+                eli5_count += 1
+        except Exception as e:
+            print(f"Could not download ELI5: {e}")
+
+    if not tasks:
+        print("WARNING: Could not download any real research data. Falling back to synthetic.")
+        return
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(output_path, "w") as f:
+        for t in tasks:
+            f.write(json.dumps(t) + "\n")
+    print(f"Saved {len(tasks)} research tasks to {output_path} (FRAMES: {frames_count}, ELI5: {eli5_count})")
+
+
+def download_agentgym_rl(output_path: str, max_samples: int = 50):
+    """Download AgentGym-RL tasks across all 5 environments.
+
+    Tries the HuggingFace dataset first; falls back to synthetic generation
+    covering WebArena, SearchQA, TextCraft, BabyAI, and SciWorld.
+    """
+    tasks = []
+
+    try:
+        from datasets import load_dataset
+
+        ds = load_dataset("AgentGym/AgentTraj-L", split="train")
+        env_map = {
+            "webarena": "webarena",
+            "searchqa": "searchqa",
+            "textcraft": "textcraft",
+            "babyai": "babyai",
+            "sciworld": "sciworld",
+        }
+        per_env = max(1, max_samples // 5)
+        env_counts: dict[str, int] = {e: 0 for e in env_map}
+
+        for row in ds:
+            env_raw = (row.get("environment") or row.get("env_name") or "").lower()
+            matched_env = None
+            for key in env_map:
+                if key in env_raw:
+                    matched_env = key
+                    break
+            if matched_env is None:
+                continue
+            if env_counts[matched_env] >= per_env:
+                continue
+
+            conversation = row.get("conversations") or row.get("messages") or []
+            if isinstance(conversation, str):
+                conversation = [{"role": "user", "content": conversation}]
+            if not conversation:
+                continue
+
+            tasks.append({
+                "task_id": f"agentgym_{matched_env}_{env_counts[matched_env]:03d}",
+                "messages": conversation,
+                "environment": matched_env,
+            })
+            env_counts[matched_env] += 1
+
+            if len(tasks) >= max_samples:
+                break
+
+        if tasks:
+            print(f"Downloaded {len(tasks)} AgentGym-RL tasks: {dict(env_counts)}")
+    except Exception as e:
+        print(f"Could not download AgentGym-RL dataset: {e}")
+
+    if not tasks:
+        print("Generating synthetic AgentGym-RL tasks for all 5 environments.")
+        tasks = _gen_synthetic_agentgym(max_samples)
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(output_path, "w") as f:
+        for t in tasks:
+            f.write(json.dumps(t) + "\n")
+    print(f"Saved {len(tasks)} AgentGym-RL tasks to {output_path}")
+
+
+def _gen_synthetic_agentgym(n: int) -> list[dict]:
+    """Generate synthetic tasks across all 5 AgentGym-RL environments."""
+    env_configs = {
+        "webarena": {
+            "system": (
+                "You are a web navigation agent in a WebArena environment. "
+                "Navigate web pages, click elements, fill forms, and search to complete the task. "
+                "Observe the accessibility tree after each action to understand the page state."
+            ),
+            "tasks": [
+                "Find the cheapest laptop with at least 16GB RAM on the shopping site and add it to cart.",
+                "Navigate to the user forums and find the most recent post about shipping delays.",
+                "Search for 'wireless headphones', filter by price under $50, and compare the top 3 results.",
+                "Log in with the test account, go to order history, and find the tracking number for order #1234.",
+                "Find the return policy page and summarize the conditions for electronics returns.",
+            ],
+        },
+        "searchqa": {
+            "system": (
+                "You are a SearchQA agent. Use search and document reading tools to find the answer "
+                "to the given question. Search from multiple angles and verify across sources."
+            ),
+            "tasks": [
+                "What year was the first successful organ transplant performed, and who was the surgeon?",
+                "How many UNESCO World Heritage Sites are there in Italy as of 2024?",
+                "What is the chemical formula of the compound commonly known as baking soda, and what is its primary industrial use?",
+                "Which country hosted the first Winter Olympics, and in what year?",
+                "What is the tallest waterfall in the world and where is it located?",
+            ],
+        },
+        "textcraft": {
+            "system": (
+                "You are an agent in a TextCraft environment, a text-based crafting game. "
+                "Gather materials, learn recipes, and craft the requested item. "
+                "Check your inventory and available recipes to plan your crafting path."
+            ),
+            "tasks": [
+                "Craft a stone sword. You may need to gather materials first.",
+                "Craft a bookshelf. Plan the full material chain needed.",
+                "Create 5 torches using available resources.",
+                "Craft a bow and 10 arrows for hunting.",
+                "Build a furnace and use it to smelt iron ore into iron ingots.",
+            ],
+        },
+        "babyai": {
+            "system": (
+                "You are an agent in a BabyAI grid world. Navigate the grid, pick up objects, "
+                "and interact with doors/boxes to complete the given instruction. "
+                "Observe your surroundings and plan an efficient path."
+            ),
+            "tasks": [
+                "Go to the red ball.",
+                "Pick up the blue key and open the blue door.",
+                "Put the green ball next to the purple box.",
+                "Pick up the yellow key, then go to the grey ball.",
+                "Open the red door, then pick up the blue ball behind it.",
+            ],
+        },
+        "sciworld": {
+            "system": (
+                "You are a science experiment agent in SciWorld. Conduct experiments by "
+                "moving between labs, collecting equipment and materials, and performing "
+                "procedures to answer the scientific question. Record your findings."
+            ),
+            "tasks": [
+                "Determine whether salt or sugar dissolves faster in water at room temperature.",
+                "Measure the pH of three different soil samples and rank them from most acidic to most basic.",
+                "Heat water to boiling and record the temperature at which it begins to boil.",
+                "Mix an acid and a base together and observe the reaction. Use an indicator to verify neutralization.",
+                "Grow a plant seed with and without fertilizer and compare growth after 5 simulated days.",
+            ],
+        },
+    }
+
+    tasks = []
+    per_env = max(1, n // 5)
+    for env_name, cfg in env_configs.items():
+        for i in range(per_env):
+            task_text = cfg["tasks"][i % len(cfg["tasks"])]
+            tasks.append({
+                "task_id": f"agentgym_{env_name}_{i:03d}",
+                "environment": env_name,
+                "messages": [
+                    {"role": "system", "content": cfg["system"]},
+                    {"role": "user", "content": task_text},
+                ],
+            })
+    return tasks[:n]
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Download and prepare benchmark datasets")
     parser.add_argument("--output-dir", default="benchmark/data")
@@ -337,3 +589,5 @@ if __name__ == "__main__":
     download_bird_sql(f"{d}/bird_sql.jsonl", n)
     download_code_contests(f"{d}/code_contests.jsonl", n)
     download_numina_math(f"{d}/numina_math.jsonl", n)
+    download_research_data(f"{d}/research_tasks_real.jsonl", n)
+    download_agentgym_rl(f"{d}/agentgym_rl_tasks.jsonl", n)

@@ -8,29 +8,31 @@ system_prompt: >
 
 server:
   base_url: "http://localhost:8000/v1"
-  model: "Qwen/Qwen2.5-3B-Instruct"
+  model: "Qwen3-30B-A3B-Thinking-2507"
 
 rollout:
-  max_turns: 40
-  max_tokens_per_turn: 2048
+  max_turns: 256
+  max_tokens_per_turn: 65536
   temperature: 0.7
   top_p: 0.95
-  max_context_tokens: 32000
+  max_context_tokens: 262144
 
 dataset:
-  path: "benchmark/data/research_tasks.jsonl"
+  path: "benchmark/data/research_tasks_real.jsonl"
   prompt_key: "messages"
   task_id_key: "task_id"
-  max_samples: 50
+  max_samples: 64
 
 tool_executor:
-  module: "mock_search"
-  class: "MockSearchExecutor"
+  module: "real_search"
+  class: "RealSearchExecutor"
   kwargs:
-    max_results: 5
-    page_length: 5
+    max_results: 100
+    max_page_chars: 65536
+    timeout: 40
 
-concurrency: 8
+num_rollouts: 8
+concurrency: 128
 
 output:
-  path: "benchmark/results/deep_research.jsonl"
+  path: "benchmark/results/deep_research_thinking.jsonl"
