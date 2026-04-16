@@ -1,15 +1,53 @@
-set -x
+#!/usr/bin/env bash
+set -xeuo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+VENV_DIR="$REPO_ROOT/.verl"
+PYTHON_BIN="$VENV_DIR/bin/python"
+DATA_ROOT="$HOME/data"
 
-gsm8k_train_path=$HOME/data/gsm8k/train.parquet
-gsm8k_test_path=$HOME/data/gsm8k/test.parquet
-math_train_path=$HOME/data/math/train.parquet
-math_test_path=$HOME/data/math/test.parquet
+if [ ! -x "$PYTHON_BIN" ]; then
+    echo "Expected Python environment at $PYTHON_BIN" >&2
+    echo "Create it with: uv venv \"$VENV_DIR\" --python 3.12" >&2
+    exit 1
+fi
+
+export VIRTUAL_ENV="$VENV_DIR"
+export PATH="$VENV_DIR/bin:$PATH"
+export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+
+gsm8k_dir="$DATA_ROOT/gsm8k"
+math_dir="$DATA_ROOT/math"
+gsm8k_train_path="$gsm8k_dir/train.parquet"
+gsm8k_test_path="$gsm8k_dir/test.parquet"
+math_train_path="$math_dir/train.parquet"
+math_test_path="$math_dir/test.parquet"
+
+ensure_dataset() {
+    local dataset_name="$1"
+    local train_path="$2"
+    local test_path="$3"
+    local preprocess_script="$4"
+    local save_dir="$5"
+
+    if [ -s "$train_path" ] && [ -s "$test_path" ]; then
+        echo "$dataset_name dataset already exists in $save_dir"
+        return
+    fi
+
+    echo "$dataset_name dataset not found. Downloading and preprocessing into $save_dir"
+    mkdir -p "$save_dir"
+    "$PYTHON_BIN" "$preprocess_script" --local_save_dir "$save_dir"
+}
+
+ensure_dataset "GSM8K" "$gsm8k_train_path" "$gsm8k_test_path" "$REPO_ROOT/examples/data_preprocess/gsm8k.py" "$gsm8k_dir"
+ensure_dataset "MATH" "$math_train_path" "$math_test_path" "$REPO_ROOT/examples/data_preprocess/math_dataset.py" "$math_dir"
 
 train_files="['$gsm8k_train_path', '$math_train_path']"
 test_files="['$gsm8k_test_path', '$math_test_path']"
 
-python3 -m verl.trainer.main_ppo \
+"$PYTHON_BIN" -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     data.train_files="$train_files" \
     data.val_files="$test_files" \
@@ -44,6 +82,8 @@ python3 -m verl.trainer.main_ppo \
     trainer.experiment_name='qwen2_7b_function_rm' \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
-    trainer.save_freq=20 \
-    trainer.test_freq=5 \
-    trainer.total_epochs=15 $@
+    trainer.save_freq=-1 \
+    trainer.test_freq=-1 \
+    trainer.total_training_steps=20 \
+    trainer.total_epochs=1 \
+    "$@"
