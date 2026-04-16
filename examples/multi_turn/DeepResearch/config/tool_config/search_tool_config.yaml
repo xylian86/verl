@@ -1,0 +1,24 @@
+tools:
+  - class_name: verl.tools.search_tool.SearchTool
+    config:
+      retrieval_service_url: http://xlian-server-0.xlian-server.mltraining-dev.svc.cluster.local:8001/retrieve 
+      topk: 5
+      num_workers: 1
+      rate_limit: 1
+      timeout: 30
+      type: native
+    tool_schema:
+      type: function
+      function:
+        name: search
+        description: Search external knowledge for evidence relevant to the current question.
+        parameters:
+          type: object
+          properties:
+            query_list:
+              type: array
+              items:
+                type: string
+              description: A list of fully formed search queries.
+          required:
+            - query_list

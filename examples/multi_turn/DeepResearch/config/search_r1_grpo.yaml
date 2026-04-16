@@ -1,0 +1,35 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+data:
+  max_prompt_length: 1024
+  max_response_length: 28672
+  train_batch_size: 512
+  val_batch_size: 256
+  return_raw_chat: True
+  shuffle: False
+  filter_overlong_prompts: True
+  truncation: error
+
+actor_rollout_ref:
+  hybrid_engine: True
+  rollout:
+    name: vllm
+    mode: async
+    enforce_eager: False
+    free_cache_engine: True
+    max_model_len: 32768
+    max_num_batched_tokens: 131072
+    multi_turn:
+      enable: True
+      max_assistant_turns: 20
+      max_user_turns: 20
+      max_tool_response_length: 16000
+      format: hermes
+      use_inference_chat_template: False
+      tokenization_sanity_check_mode: disable
