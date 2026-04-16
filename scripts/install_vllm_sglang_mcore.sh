@@ -2,6 +2,17 @@
 
 set -euo pipefail
 
+# uv venv .verl --python 3.12
+# sudo update-alternatives --set cuda /usr/local/cuda-13.0
+# sudo rm /etc/alternatives/cuda; sudo ln -sf /usr/local/cuda-13.0 /etc/alternatives/cuda
+# source .verl/bin/activate
+# uv pip install vllm==0.12.0 --torch-backend=auto
+# uv pip install setuptools wheel packaging ninja
+# uv pip install --no-build-isolation  flash-attn
+# python -c "import flash_attn; print(flash_attn.__version__)"
+# uv pip install -r requirements.txt --no-build-isolation --no-deps
+# bash scripts/install_vllm_sglang_mcore.sh
+
 USE_MEGATRON=${USE_MEGATRON:-1}
 USE_SGLANG=${USE_SGLANG:-1}
 
