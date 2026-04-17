@@ -187,6 +187,20 @@ class vLLMAsyncRollout(BaseRollout):
             else int(ray.get_runtime_context().get_accelerator_ids()[device_name][0])
         )
         self.vllm_config = all_kwargs[0]["vllm_config"]
+        # vLLM 0.14+ asserts in GPUWorker.init_device() that
+        # `parallel_config.local_world_size <= visible_device_count` whenever the
+        # executor backend is not 'ray'/'external_launcher'. With Arctic Inference
+        # SP > 1 (or TP > 1) under our ExternalZeroMQDistributedExecutor each
+        # worker actor only owns 1 visible GPU while the SP/TP world size is >1,
+        # which would trip that assertion. Tag the parallel_config as
+        # 'external_launcher' on the worker side -- that's exactly what verl is
+        # doing -- so the visible-devices check is skipped.
+        try:
+            pc = self.vllm_config.parallel_config
+            if pc.distributed_executor_backend not in ("ray", "external_launcher"):
+                pc.distributed_executor_backend = "external_launcher"
+        except AttributeError:
+            pass
         if self.lora_config:
             lora_dtype = getattr(torch, self.config.dtype)
             self.vllm_config.lora_config = LoRAConfig(lora_dtype=lora_dtype, **self.lora_config)
@@ -202,7 +216,13 @@ class vLLMAsyncRollout(BaseRollout):
                 # Will remove the patch after vllm support on-the-fly quant for rollout natively.
                 apply_vllm_fp8_patches()
 
-        self.inference_engine = WorkerWrapperBase(vllm_config=self.vllm_config)
+        # vLLM 0.14+ removed `vllm_config` from WorkerWrapperBase.__init__
+        # (it now reads vllm_config from all_kwargs[rpc_rank]["vllm_config"]
+        # inside init_worker). Stay compatible with both 0.12.x and 0.14.x.
+        try:
+            self.inference_engine = WorkerWrapperBase(vllm_config=self.vllm_config)
+        except TypeError:
+            self.inference_engine = WorkerWrapperBase(rpc_rank=0)
         self.inference_engine.init_worker(all_kwargs)
 
     def _load_model(self, *args, **kwargs):
@@ -258,6 +278,23 @@ class vLLMAsyncRollout(BaseRollout):
             model = model_runner.model
             patch_vllm_moe_model_weight_loader(model)
 
+            # Arctic Inference Shift Parallelism builds a second model
+            # (`shift_model`, TP-only fallback used when batch tokens are below
+            # `shift_parallel_threshold`). It is created via vllm.get_model with
+            # whatever load_format vLLM was configured with (here "dummy"), so
+            # without explicit weight injection it stays at random init and
+            # outputs gibberish. Detect it and stream the same weights into
+            # both models so they stay in sync each rollout step.
+            shift_model = getattr(model_runner, "shift_model", None)
+            shift_inner = shift_model
+            if shift_inner is not None:
+                # Unwrap CUDAGraphWrapper / DDP-style wrappers if present.
+                inner_attr = getattr(shift_inner, "runnable", None)
+                if inner_attr is not None and hasattr(inner_attr, "load_weights"):
+                    shift_inner = inner_attr
+            if shift_inner is not None:
+                patch_vllm_moe_model_weight_loader(shift_inner)
+
             # Add the FP8 related logic here as sharding manager has been deprecated.
             # Check if FP8 quantization is enabled and apply appropriate weight loading
             if is_fp8_model(model_runner.vllm_config):
@@ -265,9 +302,33 @@ class vLLMAsyncRollout(BaseRollout):
                 # Convert bf16 weights to fp8 format before loading
                 loaded_params = load_quanted_weights(weights, model_runner)
                 logger.info(f"FP8 weights loaded (async), loaded_params: {len(loaded_params)}")
+                if shift_inner is not None:
+                    raise NotImplementedError(
+                        "Arctic Inference shift_parallel + FP8 weight sync is not implemented yet."
+                    )
             else:
                 logger.info("Loading standard weights (non-FP8, async)")
-                model.load_weights(weights)
+                if shift_inner is None:
+                    model.load_weights(weights)
+                else:
+                    # Materialize the generator once so we can replay it for
+                    # both the Ulysses model and the shift (TP) model. vLLM's
+                    # load_weights consumes the iterator and applies its own
+                    # per-model sharding, so both must see identical (name,
+                    # tensor) pairs but be loaded independently.
+                    weights_list = list(weights)
+                    model.load_weights(iter(weights_list))
+                    from arctic_inference.vllm.model_runner import (
+                        set_shift_parallel_mode,
+                    )
+                    with set_shift_parallel_mode(True):
+                        shift_inner.load_weights(iter(weights_list))
+                    logger.info(
+                        "Arctic shift_parallel: synced %d weight tensors into "
+                        "shift_model",
+                        len(weights_list),
+                    )
+                    del weights_list
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         """Batch generate sequences in sync mode.

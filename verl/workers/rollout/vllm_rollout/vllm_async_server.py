@@ -85,9 +85,11 @@ class ExternalZeroMQDistributedExecutor(Executor):
     def _init_executor(self) -> None:
         dp_rank_local = self.vllm_config.parallel_config.data_parallel_rank_local
         tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+        sp_size = self.vllm_config.parallel_config.ulysses_sequence_parallel_size
+        per_dp = tp_size * sp_size
 
         addresses = os.environ["VERL_VLLM_ZMQ_ADDRESSES"].split(",")
-        addresses = addresses[dp_rank_local * tp_size : (dp_rank_local + 1) * tp_size]
+        addresses = addresses[dp_rank_local * per_dp : (dp_rank_local + 1) * per_dp]
         self.context = zmq.Context()
         self.sockets = []
         for address in addresses:
@@ -314,6 +316,32 @@ class vLLMHttpServerBase:
             "hf_overrides": hf_overrides,
             **engine_kwargs,
         }
+
+        # Arctic Inference Shift Parallelism: wire Ulysses SP / shift-parallel
+        # flags into the vLLM engine and make sure the Arctic plugin loads
+        # inside the server actor process too.
+        arctic_sp_size = self.config.ulysses_sequence_parallel_size
+        arctic_shift = self.config.enable_shift_parallel
+        if arctic_sp_size > 1:
+            os.environ["ARCTIC_INFERENCE_ENABLED"] = os.environ.get(
+                "ARCTIC_INFERENCE_ENABLED", "1"
+            )
+            try:
+                import arctic_inference  # noqa: F401
+                import vllm.plugins as _vllm_plugins
+                _vllm_plugins.load_general_plugins()
+            except ImportError as exc:
+                raise ImportError(
+                    "arctic_inference is required for Shift Parallelism / "
+                    "Ulysses sequence parallelism. Install arctic-inference in "
+                    "the same venv as vLLM."
+                ) from exc
+            args["ulysses_sequence_parallel_size"] = arctic_sp_size
+            if arctic_shift:
+                args["enable_shift_parallel"] = True
+                args["shift_parallel_threshold"] = int(
+                    self.config.get("shift_parallel_threshold", 512)
+                )
 
         if self.config.prometheus.enable:
             if self.config.prometheus.served_model_name:

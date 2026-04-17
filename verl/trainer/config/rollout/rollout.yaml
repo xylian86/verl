@@ -58,6 +58,14 @@ expert_parallel_size: 1
 # PP size for rollout.
 pipeline_model_parallel_size: 1
 
+# Arctic Inference Shift Parallelism (Ulysses sequence parallelism).
+# Requires the arctic-inference vLLM plugin (ARCTIC_INFERENCE_ENABLED=1).
+# enable_shift_parallel flips between TP-shift and Ulysses at decode time
+# based on shift_parallel_threshold batched tokens.
+ulysses_sequence_parallel_size: 1
+enable_shift_parallel: False
+shift_parallel_threshold: 512
+
 # max number of tokens in a batch
 max_num_batched_tokens: 8192
 

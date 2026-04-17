@@ -148,6 +148,12 @@ class RolloutConfig(BaseConfig):
     expert_parallel_size: int = 1
     tensor_model_parallel_size: int = 2
     pipeline_model_parallel_size: int = 1
+
+    # Arctic Inference Shift Parallelism (Ulysses SP) knobs. 
+    ulysses_sequence_parallel_size: int = 1
+    enable_shift_parallel: bool = False
+    shift_parallel_threshold: int = 512
+
     max_num_batched_tokens: int = 8192
     logprobs_mode: Optional[str] = "processed_logprobs"
 
@@ -245,3 +251,8 @@ class RolloutConfig(BaseConfig):
                 raise NotImplementedError(
                     f"Current rollout {self.name=} not implemented pipeline_model_parallel_size > 1 yet."
                 )
+
+        if self.ulysses_sequence_parallel_size > 1 and self.name != "vllm":
+            raise NotImplementedError(
+                f"ulysses_sequence_parallel_size > 1 is only supported for rollout.name=vllm, got {self.name!r}."
+            )
