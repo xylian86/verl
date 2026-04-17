@@ -6,7 +6,7 @@ set -euo pipefail
 # sudo update-alternatives --set cuda /usr/local/cuda-13.0
 # sudo rm /etc/alternatives/cuda; sudo ln -sf /usr/local/cuda-13.0 /etc/alternatives/cuda
 # source .verl/bin/activate
-# uv pip install vllm==0.12.0 --torch-backend=auto
+# uv pip install vllm==0.14.1 --torch-backend=auto
 # uv pip install setuptools wheel packaging ninja
 # uv pip install --no-build-isolation  flash-attn
 # python -c "import flash_attn; print(flash_attn.__version__)"
@@ -43,7 +43,7 @@ echo "1. install inference frameworks and pytorch they need"
 
 echo "2. install basic packages"
 pip_install_preserve_versions "transformers[hf_xet]>=4.51.0" accelerate datasets peft hf-transfer \
-    "numpy<2.0.0" "pyarrow>=15.0.0" pandas "tensordict>=0.8.0,<=0.10.0,!=0.9.0" torchdata \
+    "numpy==2.2.6" "pyarrow>=15.0.0" pandas "tensordict>=0.8.0,<=0.10.0,!=0.9.0" torchdata \
     ray[default] codetiming hydra-core pylatexenc qwen-vl-utils wandb dill pybind11 liger-kernel mathruler \
     pytest py-spy pre-commit ruff tensorboard
 
