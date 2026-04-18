@@ -13,19 +13,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import json
 import logging
 import os
 import threading
-from contextlib import ExitStack
 from enum import Enum
 from typing import Any, Callable, Optional, TypeVar
 from uuid import uuid4
 
+import httpx
 import ray
 import ray.actor
 
-from verl.tools.utils.search_r1_like_utils import perform_single_search_batch
+from verl.tools.utils.search_r1_like_utils import (
+    async_perform_single_search_batch,
+    perform_single_search_batch,
+)
 from verl.utils.rollout_trace import rollout_trace_op
 
 from .base_tool import BaseTool
@@ -78,26 +82,56 @@ class SearchExecutionWorker:
         self.rate_limit_worker = self._init_rate_limit(rate_limit) if enable_global_rate_limit else None
 
     def _init_rate_limit(self, rate_limit):
-        """Initialize singleton rate limiter."""
-        return TokenBucketWorker.options(name="rate-limiter", get_if_exists=True).remote(rate_limit)
+        """Initialize singleton rate limiter as a detached actor so it survives the
+        death of any individual SearchExecutionWorker that happens to create it
+        first. Without lifetime="detached", Ray makes the first creator the owner;
+        when that creator dies the rate-limiter is GCed and every other worker's
+        acquire/release raises ActorDiedError, cascading into worker SIGABRTs.
+        """
+        return TokenBucketWorker.options(
+            name="rate-limiter",
+            get_if_exists=True,
+            lifetime="detached",
+            namespace="verl-search-tool",
+        ).remote(rate_limit)
 
     def ping(self):
         """Health check method."""
         return True
 
     def execute(self, fn: Callable[..., T], *fn_args, **fn_kwargs) -> T:
-        """Execute function with optional rate limiting."""
+        """Execute function with optional rate limiting.
+
+        Robust against rate-limiter death: if acquire/release fails we fall back
+        to running the function without global rate limiting rather than letting
+        the exception propagate up and SIGABRT the worker.
+        """
         if self.rate_limit_worker:
-            with ExitStack() as stack:
-                stack.callback(self.rate_limit_worker.release.remote)
+            acquired = False
+            try:
                 ray.get(self.rate_limit_worker.acquire.remote())
-                try:
-                    return fn(*fn_args, **fn_kwargs)
-                except Exception as e:
-                    # TODO we should make this available to the tool caller
-                    logger.warning(f"Error when executing search: {e}")
+                acquired = True
+            except Exception as e:
+                logger.warning(
+                    f"Rate limiter acquire failed ({e}); proceeding without global rate limit"
+                )
+            try:
+                return fn(*fn_args, **fn_kwargs)
+            except Exception as e:
+                logger.warning(f"Error when executing search: {e}")
+                return None
+            finally:
+                if acquired:
+                    try:
+                        ray.get(self.rate_limit_worker.release.remote())
+                    except Exception as e:
+                        logger.warning(f"Rate limiter release failed: {e}")
         else:
-            return fn(*fn_args, **fn_kwargs)
+            try:
+                return fn(*fn_args, **fn_kwargs)
+            except Exception as e:
+                logger.warning(f"Error when executing search: {e}")
+                return None
 
 
 def init_search_execution_pool(
@@ -159,18 +193,37 @@ class SearchTool(BaseTool):
         super().__init__(config, tool_schema)
         self._instance_dict = {}
 
-        # Worker and rate limiting configuration
+        # Worker and rate limiting configuration (kept for the Ray path)
         self.num_workers = config.get("num_workers", 120)
         self.rate_limit = config.get("rate_limit", 120)
         self.timeout = config.get("timeout", 30)
-
         self.enable_global_rate_limit = config.get("enable_global_rate_limit", True)
-        self.execution_pool = init_search_execution_pool(
-            num_workers=self.num_workers,
-            enable_global_rate_limit=self.enable_global_rate_limit,
-            rate_limit=self.rate_limit,
-            mode=PoolMode.ThreadMode,
-        )
+
+        # Async HTTP path (default). Bypasses the Ray actor funnel and talks
+        # to the retriever directly from the agent loop's asyncio event loop
+        # using httpx.AsyncClient. Concurrency is bounded in-process by an
+        # asyncio.Semaphore (max_concurrent_requests).
+        self.use_async_http = config.get("use_async_http", True)
+        self.max_concurrent_requests = config.get("max_concurrent_requests", 256)
+        self.http_max_connections = config.get("http_max_connections", 512)
+        self.http_max_keepalive = config.get("http_max_keepalive", 256)
+
+        # Lazily-created per-event-loop httpx client + semaphore. We can't
+        # build them in __init__ because no event loop is running at that
+        # point, and httpx.AsyncClient binds to the current loop on first use.
+        self._async_client: Optional[httpx.AsyncClient] = None
+        self._async_semaphore: Optional[asyncio.Semaphore] = None
+        self._async_init_lock = threading.Lock()
+
+        # Ray-based execution pool (legacy path, only built when async is off)
+        self.execution_pool = None
+        if not self.use_async_http:
+            self.execution_pool = init_search_execution_pool(
+                num_workers=self.num_workers,
+                enable_global_rate_limit=self.enable_global_rate_limit,
+                rate_limit=self.rate_limit,
+                mode=PoolMode.ThreadMode,
+            )
 
         # Retrieval service configuration
         self.retrieval_service_url = config.get("retrieval_service_url")
@@ -180,6 +233,24 @@ class SearchTool(BaseTool):
             raise ValueError("retrieval_service_url is not set")
 
         logger.info(f"Initialized SearchTool with config: {config}")
+
+    def _ensure_async_resources(self):
+        """Lazily create the httpx client + semaphore on first use."""
+        if self._async_client is not None and self._async_semaphore is not None:
+            return
+        with self._async_init_lock:
+            if self._async_client is None:
+                limits = httpx.Limits(
+                    max_connections=self.http_max_connections,
+                    max_keepalive_connections=self.http_max_keepalive,
+                )
+                self._async_client = httpx.AsyncClient(
+                    limits=limits,
+                    timeout=httpx.Timeout(self.timeout),
+                    http2=False,
+                )
+            if self._async_semaphore is None:
+                self._async_semaphore = asyncio.Semaphore(self.max_concurrent_requests)
 
     def get_openai_tool_schema(self) -> OpenAIFunctionToolSchema:
         """Return the OpenAI tool schema."""
@@ -247,11 +318,28 @@ class SearchTool(BaseTool):
             logger.error(f"[SearchTool] {error_msg} Received parameters: {parameters}")
             return ToolResponse(text=json.dumps({"result": error_msg})), 0.0, {}
 
-        # Execute search using Ray execution pool
+        # Execute search either via the in-process async HTTP client (default,
+        # fast) or via the legacy Ray actor pool (kept for backwards compat).
         try:
-            result_text, metadata = await self.execution_pool.execute.remote(
-                self.execute_search, instance_id, query_list_from_params, self.retrieval_service_url, self.topk, timeout
-            )
+            if self.use_async_http:
+                self._ensure_async_resources()
+                result_text, metadata = await async_perform_single_search_batch(
+                    client=self._async_client,
+                    retrieval_service_url=self.retrieval_service_url,
+                    query_list=query_list_from_params,
+                    topk=self.topk,
+                    semaphore=self._async_semaphore,
+                    timeout=timeout,
+                )
+            else:
+                result_text, metadata = await self.execution_pool.execute.remote(
+                    self.execute_search,
+                    instance_id,
+                    query_list_from_params,
+                    self.retrieval_service_url,
+                    self.topk,
+                    timeout,
+                )
 
             # Store results in instance dictionary
             self._instance_dict[instance_id]["reward"].append(result_text.strip())

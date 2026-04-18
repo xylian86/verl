@@ -127,6 +127,12 @@ class AgentLoopMetrics(BaseModel):
 
     generate_sequences: float = 0.0
     tool_calls: float = 0.0
+    # Per-turn token length samples emitted by multi-turn agent loops.
+    # Each list contains one entry per turn for a single rollout. They are
+    # pooled across rollouts in `_performance_metrics` to expose
+    # `agent_loop/{assistant,tool_response}_tokens_per_turn/{mean,max,min}`.
+    assistant_tokens_per_turn: list[int] = []
+    tool_response_tokens_per_turn: list[int] = []
 
 
 class AgentLoopOutput(BaseModel):
@@ -986,6 +992,27 @@ class AgentLoopManager:
         timing["agent_loop/slowest/tool_calls"] = t_tool_calls[slowest]
         timing["agent_loop/slowest/prompt_length"] = attention_mask[:prompt_length].sum().item()
         timing["agent_loop/slowest/response_length"] = attention_mask[prompt_length:].sum().item()
+
+        # Per-turn token length distributions (when emitted by the agent loop).
+        # We flatten the per-rollout lists into one pool and report mean/max/min
+        # over individual turns so users can see "what is the average tool
+        # response / assistant generation length per turn".
+        for src_key, dst_prefix in (
+            ("assistant_tokens_per_turn", "agent_loop/assistant_tokens_per_turn"),
+            ("tool_response_tokens_per_turn", "agent_loop/tool_response_tokens_per_turn"),
+        ):
+            pooled: list[float] = []
+            for chunk in metrics:
+                for metric in chunk:
+                    vals = metric.get(src_key)
+                    if vals:
+                        pooled.extend(float(v) for v in vals)
+            if pooled:
+                arr = np.array(pooled)
+                timing[f"{dst_prefix}/mean"] = float(arr.mean())
+                timing[f"{dst_prefix}/max"] = float(arr.max())
+                timing[f"{dst_prefix}/min"] = float(arr.min())
+                timing[f"{dst_prefix}/count"] = int(arr.size)
 
         return timing
 

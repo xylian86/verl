@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import json
 import logging
 import threading
@@ -21,6 +22,7 @@ import traceback
 import uuid
 from typing import Any, Optional
 
+import httpx
 import requests
 
 DEFAULT_TIMEOUT = 30  # Default search request timeout
@@ -241,5 +243,187 @@ def perform_single_search_batch(
             {"result": "Unknown API state (no response and no error message)."}, ensure_ascii=False
         )
         logger.error("Batch search: Unknown API state.")
+
+    return result_text, metadata
+
+
+# ---------------------------------------------------------------------------
+# Async (httpx) variants
+# ---------------------------------------------------------------------------
+#
+# The synchronous functions above route every call through Ray + a blocking
+# `requests.post`, which makes the tool call funnel through a small pool of
+# OS threads inside one Ray actor. For high-fanout RL rollouts this becomes
+# the dominant cost. The functions below skip Ray entirely and talk to the
+# retriever from inside the agent loop's own asyncio event loop using
+# `httpx.AsyncClient`. Concurrency is still bounded by the caller via an
+# `asyncio.Semaphore` so we don't melt the retriever.
+
+
+async def async_call_search_api(
+    client: httpx.AsyncClient,
+    retrieval_service_url: str,
+    query_list: list[str],
+    topk: int = 3,
+    return_scores: bool = True,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """Async version of :func:`call_search_api` using ``httpx.AsyncClient``.
+
+    Mirrors the retry behaviour of the sync version (server-error / connection /
+    timeout retries with linearly increasing backoff) but uses ``await
+    asyncio.sleep`` so it never blocks the event loop.
+    """
+    request_id = str(uuid.uuid4())
+    log_prefix = f"[Search Request ID: {request_id}] "
+
+    payload = {"queries": query_list, "topk": topk, "return_scores": return_scores}
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+
+    last_error: Optional[str] = None
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            logger.debug(
+                f"{log_prefix}Attempt {attempt + 1}/{MAX_RETRIES}: Calling search API at {retrieval_service_url}"
+            )
+            response = await client.post(
+                retrieval_service_url,
+                headers=headers,
+                json=payload,
+                timeout=timeout,
+            )
+
+            if response.status_code in (500, 502, 503, 504):
+                last_error = (
+                    f"{log_prefix}API Request Error: Server Error ({response.status_code}) on attempt "
+                    f"{attempt + 1}/{MAX_RETRIES}"
+                )
+                logger.warning(last_error)
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(INITIAL_RETRY_DELAY * (attempt + 1))
+                continue
+
+            response.raise_for_status()
+            return response.json(), None
+
+        except (httpx.ConnectError, httpx.RemoteProtocolError) as e:
+            last_error = f"{log_prefix}Connection Error: {e}"
+            logger.warning(last_error)
+            if attempt < MAX_RETRIES - 1:
+                await asyncio.sleep(INITIAL_RETRY_DELAY * (attempt + 1))
+            continue
+        except (httpx.TimeoutException,) as e:
+            last_error = f"{log_prefix}Timeout Error: {e}"
+            logger.warning(last_error)
+            if attempt < MAX_RETRIES - 1:
+                await asyncio.sleep(INITIAL_RETRY_DELAY * (attempt + 1))
+            continue
+        except httpx.HTTPError as e:
+            last_error = f"{log_prefix}API Request Error: {e}"
+            break
+        except json.JSONDecodeError as e:
+            raw = ""
+            try:
+                raw = response.text  # type: ignore[name-defined]
+            except Exception:
+                pass
+            last_error = f"{log_prefix}API Response JSON Decode Error: {e}, Response: {raw[:200]}"
+            break
+        except Exception as e:
+            last_error = f"{log_prefix}Unexpected Error: {e}"
+            break
+
+    logger.error(f"{log_prefix}Search API call failed. Last error: {last_error}")
+    return None, (
+        last_error.replace(log_prefix, "API Call Failed: ") if last_error else "API Call Failed after retries"
+    )
+
+
+async def async_perform_single_search_batch(
+    client: httpx.AsyncClient,
+    retrieval_service_url: str,
+    query_list: list[str],
+    topk: int = 3,
+    semaphore: Optional[asyncio.Semaphore] = None,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> tuple[str, dict[str, Any]]:
+    """Async version of :func:`perform_single_search_batch`.
+
+    ``semaphore`` is an ``asyncio.Semaphore`` used to bound the number of
+    in-flight requests against the retriever. Pass ``None`` for unbounded.
+    """
+    logger.debug(f"Starting async batch search for {len(query_list)} queries.")
+
+    api_response = None
+    error_msg: Optional[str] = None
+
+    async def _do_call():
+        return await async_call_search_api(
+            client=client,
+            retrieval_service_url=retrieval_service_url,
+            query_list=query_list,
+            topk=topk,
+            return_scores=True,
+            timeout=timeout,
+        )
+
+    try:
+        if semaphore is not None:
+            async with semaphore:
+                api_response, error_msg = await _do_call()
+        else:
+            api_response, error_msg = await _do_call()
+    except Exception as e:
+        error_msg = f"API Request Exception during batch search: {e}"
+        logger.error(f"Async batch search: {error_msg}")
+        traceback.print_exc()
+
+    metadata: dict[str, Any] = {
+        "query_count": len(query_list),
+        "queries": query_list,
+        "api_request_error": error_msg,
+        "api_response": None,
+        "status": "unknown",
+        "total_results": 0,
+        "formatted_result": None,
+    }
+
+    result_text = json.dumps({"result": "Search request failed or timed out after retries."}, ensure_ascii=False)
+
+    if error_msg:
+        metadata["status"] = "api_error"
+        result_text = json.dumps({"result": f"Search error: {error_msg}"}, ensure_ascii=False)
+        logger.error(f"Async batch search: API error occurred: {error_msg}")
+    elif api_response:
+        metadata["api_response"] = api_response
+        try:
+            raw_results = api_response.get("result", [])
+            if raw_results:
+                pretty_results = []
+                total_results = 0
+                for retrieval in raw_results:
+                    formatted = _passages2string(retrieval)
+                    pretty_results.append(formatted)
+                    total_results += len(retrieval) if isinstance(retrieval, list) else 1
+                final_result = "\n---\n".join(pretty_results)
+                result_text = json.dumps({"result": final_result}, ensure_ascii=False)
+                metadata["status"] = "success"
+                metadata["total_results"] = total_results
+                metadata["formatted_result"] = final_result
+            else:
+                result_text = json.dumps({"result": "No search results found."}, ensure_ascii=False)
+                metadata["status"] = "no_results"
+        except Exception as e:
+            err = f"Error processing search results: {e}"
+            result_text = json.dumps({"result": err}, ensure_ascii=False)
+            metadata["status"] = "processing_error"
+            logger.error(f"Async batch search: {err}")
+    else:
+        metadata["status"] = "unknown_api_state"
+        result_text = json.dumps(
+            {"result": "Unknown API state (no response and no error message)."}, ensure_ascii=False
+        )
+        logger.error("Async batch search: Unknown API state.")
 
     return result_text, metadata

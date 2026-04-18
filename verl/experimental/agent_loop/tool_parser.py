@@ -92,13 +92,51 @@ class HermesToolParser(ToolParser):
 
         matches = self.tool_call_regex.findall(text)
         function_calls = []
+        decoder = json.JSONDecoder()
         for match in matches:
-            try:
-                function_call = json.loads(match)
-                name, arguments = function_call["name"], function_call["arguments"]
-                function_calls.append(FunctionCall(name=name, arguments=json.dumps(arguments, ensure_ascii=False)))
-            except Exception as e:
-                logger.error(f"Failed to decode tool call: {e}")
+            block = match.strip()
+            if not block:
+                continue
+            # A single <tool_call>...</tool_call> block may legitimately contain
+            # several JSON objects emitted back-to-back by the model. Use
+            # raw_decode in a loop so we accept all of them and gracefully
+            # ignore any trailing garbage instead of failing the whole block.
+            pos = 0
+            while pos < len(block):
+                # Skip whitespace / common separators between objects.
+                while pos < len(block) and block[pos] in " \t\r\n,":
+                    pos += 1
+                if pos >= len(block):
+                    break
+                try:
+                    obj, end = decoder.raw_decode(block, pos)
+                except json.JSONDecodeError as e:
+                    logger.error(f"Failed to decode tool call: {e}")
+                    break
+                pos = end
+                try:
+                    if not isinstance(obj, dict):
+                        raise ValueError(f"tool call is not a JSON object: {type(obj).__name__}")
+                    # Accept common key aliases the model sometimes emits.
+                    name = obj.get("name") or obj.get("function") or obj.get("tool") or obj.get("tool_name")
+                    arguments = obj.get("arguments")
+                    if arguments is None:
+                        arguments = obj.get("parameters", obj.get("args", {}))
+                    if not name:
+                        raise KeyError("name")
+                    if isinstance(arguments, str):
+                        # Some emissions pre-stringify the arguments; keep as-is
+                        # if it's already valid JSON, otherwise re-encode.
+                        try:
+                            json.loads(arguments)
+                            arguments_str = arguments
+                        except Exception:
+                            arguments_str = json.dumps(arguments, ensure_ascii=False)
+                    else:
+                        arguments_str = json.dumps(arguments, ensure_ascii=False)
+                    function_calls.append(FunctionCall(name=str(name), arguments=arguments_str))
+                except Exception as e:
+                    logger.error(f"Failed to decode tool call: {e}")
 
         # remaing text exclude tool call tokens
         content = self.tool_call_regex.sub("", text)

@@ -111,6 +111,7 @@ class ToolAgentLoop(AgentLoopBase):
         self.max_parallel_calls = config.actor_rollout_ref.rollout.multi_turn.max_parallel_calls
         self.max_tool_response_length = config.actor_rollout_ref.rollout.multi_turn.max_tool_response_length
         self.tool_response_truncate_side = config.actor_rollout_ref.rollout.multi_turn.tool_response_truncate_side
+        self.max_assistant_tokens_per_turn = config.actor_rollout_ref.rollout.multi_turn.max_assistant_tokens_per_turn
         tool_config_path = config.actor_rollout_ref.rollout.multi_turn.tool_config_path
         tool_list = initialize_tools_from_config(tool_config_path) if tool_config_path else []
         self.tools = {tool.name: tool for tool in tool_list}
@@ -208,6 +209,48 @@ class ToolAgentLoop(AgentLoopBase):
         output.extra_fields.update({"turn_scores": agent_data.turn_scores, "tool_rewards": agent_data.tool_rewards})
         return output
 
+    def _build_turn_sampling_params(self, sampling_params: dict[str, Any]) -> dict[str, Any]:
+        """Return a per-turn copy of sampling_params with tool-call stop strings.
+
+        Forcing the model to stop the moment it writes ``</tool_call>`` (or any
+        other parser-specific terminator) prevents post-tool-call rambling and
+        keeps the response well-formed for the parser. The stop string itself
+        is included in the output so the regex matcher still sees it.
+        """
+        params = dict(sampling_params)
+        extra_stops: list[str] = []
+        end_token = getattr(self.tool_parser, "tool_call_end_token", None)
+        if end_token:
+            extra_stops.append(end_token)
+        if extra_stops:
+            existing = params.get("stop")
+            if existing is None:
+                stop_list: list[str] = []
+            elif isinstance(existing, str):
+                stop_list = [existing]
+            else:
+                stop_list = list(existing)
+            for s in extra_stops:
+                if s not in stop_list:
+                    stop_list.append(s)
+            params["stop"] = stop_list
+            # Ensure the stop string is kept in the response so the parser regex
+            # (which looks for the closing tag) still matches.
+            params.setdefault("include_stop_str_in_output", True)
+
+        # Hard per-turn assistant token cap. Bounds straggler rollouts that
+        # would otherwise generate to the global response_length cap and block
+        # the whole batch. If a request already had a smaller max_tokens, keep
+        # that smaller value.
+        if self.max_assistant_tokens_per_turn:
+            existing_cap = params.get("max_tokens")
+            params["max_tokens"] = (
+                self.max_assistant_tokens_per_turn
+                if not existing_cap
+                else min(int(existing_cap), self.max_assistant_tokens_per_turn)
+            )
+        return params
+
     async def _handle_pending_state(self, agent_data: AgentData, sampling_params: dict[str, Any]) -> AgentState:
         """Handle the pending state: prepare the prompt and start generation."""
         prompt_ids = await self.apply_chat_template(
@@ -225,11 +268,18 @@ class ToolAgentLoop(AgentLoopBase):
         """Handle the generating state: generate model response and check for tool calls."""
         add_messages: list[dict[str, Any]] = []
 
+        # Inject parser-aware stop strings so the model halts as soon as it
+        # finishes emitting a tool call. Without this, the model often keeps
+        # generating after </tool_call> and hallucinates fake tool responses
+        # (e.g. {"text": "..."}) which then break parsing on the next turn.
+        # Use a per-call copy so we never mutate the shared sampling_params.
+        turn_sampling_params = self._build_turn_sampling_params(sampling_params)
+
         with simple_timer("generate_sequences", agent_data.metrics):
             output = await self.server_manager.generate(
                 request_id=agent_data.request_id,
                 prompt_ids=agent_data.prompt_ids,
-                sampling_params=sampling_params,
+                sampling_params=turn_sampling_params,
                 image_data=agent_data.image_data,
                 video_data=agent_data.video_data,
             )
@@ -240,6 +290,10 @@ class ToolAgentLoop(AgentLoopBase):
         agent_data.response_mask += [1] * len(agent_data.response_ids)
         if output.log_probs:
             agent_data.response_logprobs += output.log_probs
+
+        # Per-turn assistant generation length (tokens). Aggregated across
+        # rollouts in AgentLoopManager._performance_metrics.
+        agent_data.metrics.setdefault("assistant_tokens_per_turn", []).append(len(output.token_ids))
 
         if output.routed_experts is not None:
             agent_data.routed_experts = output.routed_experts
@@ -350,6 +404,11 @@ class ToolAgentLoop(AgentLoopBase):
                 videos=None,
                 remove_system_prompt=True,
             )
+
+        # Per-turn tool response length (tokens, after chat-template wrapping).
+        # This is what actually consumes context space and slows down the next
+        # generation step.
+        agent_data.metrics.setdefault("tool_response_tokens_per_turn", []).append(len(response_ids))
 
         if len(agent_data.response_mask) + len(response_ids) >= self.response_length:
             return AgentState.TERMINATED

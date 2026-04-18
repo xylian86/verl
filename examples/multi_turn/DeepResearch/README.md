@@ -26,7 +26,7 @@ It combines:
 1. Prepare Search-R1 parquet data:
 
 ```bash
-python3 examples/data_preprocess/preprocess_search_r1_dataset.py \
+python3 examples/data_preprocess/preprocess_search_datasets.py --dataset search_r1 \
   --local_dir ~/data/searchR1_processed_direct
 ```
 
@@ -84,7 +84,7 @@ bash examples/multi_turn/DeepResearch/run_search_r1_grpo_local.sh
 
 - This recipe uses async vLLM multi-turn rollout and enables `VLLM_USE_V1=1`
   in the launch script.
-- `preprocess_search_r1_dataset.py` writes `train.parquet` and `test.parquet`,
+- `preprocess_search_datasets.py` writes `train.parquet` and `test.parquet`,
   so the launch scripts expect those filenames under `DATA_DIR`.
 - To change the retrieval endpoint, edit `retrieval_service_url` in the
   relevant `config/tool_config/search_tool_config*.yaml` file.

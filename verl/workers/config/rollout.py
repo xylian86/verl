@@ -51,6 +51,9 @@ class MultiTurnConfig(BaseConfig):
     tool_config_path: Optional[str] = None
     max_user_turns: Optional[int] = None
     max_parallel_calls: int = 1
+    # Hard cap on tokens generated in a single assistant turn. 0/None disables.
+    # Used by ToolAgentLoop to bound straggler rollouts via vLLM's max_tokens.
+    max_assistant_tokens_per_turn: Optional[int] = None
     max_tool_response_length: int = 256
     tool_response_truncate_side: str = "middle"
     interaction_config_path: Optional[str] = None
