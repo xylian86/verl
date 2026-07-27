@@ -81,6 +81,11 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 device_name = get_device_name()
 
 
+def _scale_logits_by_temperature(logits: torch.Tensor, temperature: torch.Tensor) -> torch.Tensor:
+    # Some model heads return a custom-autograd view; an in-place division would invalidate its backward function.
+    return logits / temperature.clamp(min=1e-8).to(logits.dtype)
+
+
 class FSDPEngine(BaseEngine):
     """
     Concrete Engine implementation using PyTorch FullyShardedDataParallel (FSDP).
@@ -1059,7 +1064,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 entropy_rmpad = output.entropy.squeeze(0)  # (total_nnz,)
             else:
                 logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
-                logits_rmpad.div_(temperature_rmpad.clamp(min=1e-8).unsqueeze(-1).to(logits_rmpad.dtype))
+                logits_rmpad = _scale_logits_by_temperature(logits_rmpad, temperature_rmpad.unsqueeze(-1))
 
                 # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
                 inplace_backward = True
@@ -1130,7 +1135,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 logits = output.logits  # (bsz, response_length, vocab_size)
                 temperature = output_args["temperature"]  # (bsz,)
                 temperature = temperature.unsqueeze(-1).unsqueeze(-1)
-                logits.div_(temperature.clamp(min=1e-8).to(logits.dtype))
+                logits = _scale_logits_by_temperature(logits, temperature)
 
                 if calculate_entropy:
                     if not self.engine_config.entropy_checkpointing:
