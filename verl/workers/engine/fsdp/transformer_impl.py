@@ -423,6 +423,34 @@ class FSDPEngine(BaseEngine):
         return module
 
     def _build_optimizer(self, module):
+        nvme_config = self.engine_config.nvme_offload
+        if nvme_config.enabled:
+            from .nvme_optimizer import NVMeChunkedAdamW
+
+            if self.engine_config.strategy != "fsdp2":
+                raise ValueError("NVMe optimizer offload currently supports only strategy=fsdp2")
+            if self.optimizer_config.optimizer != "AdamW" or self.optimizer_config.optimizer_impl != "torch.optim":
+                raise ValueError("NVMe optimizer offload currently supports only torch.optim.AdamW")
+            overrides = dict(self.optimizer_config.override_optimizer_config or {})
+            unsupported_overrides = set(overrides) - {"eps"}
+            if unsupported_overrides:
+                raise ValueError(
+                    f"NVMe optimizer offload does not support optimizer overrides: {sorted(unsupported_overrides)}"
+                )
+            return NVMeChunkedAdamW(
+                module.named_parameters(),
+                path=nvme_config.path,
+                chunk_size_mb=nvme_config.chunk_size_mb,
+                state_dtype=nvme_config.state_dtype,
+                offload_gradients=nvme_config.offload_gradients,
+                master_weights=nvme_config.master_weights,
+                fsync=nvme_config.fsync,
+                lr=self.optimizer_config.lr,
+                betas=tuple(self.optimizer_config.betas),
+                eps=overrides.get("eps", 1e-8),
+                weight_decay=self.optimizer_config.weight_decay,
+            )
+
         from verl.workers.config.optimizer import build_optimizer
 
         optimizer = build_optimizer(module.parameters(), self.optimizer_config)

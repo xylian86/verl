@@ -41,6 +41,10 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
+def _uses_nvme_optimizer_checkpoint(optimizer: Optional[torch.optim.Optimizer]) -> bool:
+    return bool(optimizer is not None and getattr(optimizer, "_verl_nvme_optimizer", False))
+
+
 @dataclass
 class FSDPConfig:
     """Configuration for FSDP checkpointing.
@@ -134,6 +138,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             if self.should_load_optimizer
             else None
         )
+        nvme_optimizer = _uses_nvme_optimizer_checkpoint(self.optimizer)
         with get_fsdp_state_ctx(self.model, StateDictType.SHARDED_STATE_DICT, state_dict_cfg, optim_cfg):
             if self.should_load_model:
                 remote_model_path = os.path.join(local_path, f"model_world_size_{self.world_size}_rank_{self.rank}.pt")
@@ -144,10 +149,19 @@ class FSDPCheckpointManager(BaseCheckpointManager):
 
             if self.should_load_optimizer:
                 remote_optim_path = os.path.join(local_path, f"optim_world_size_{self.world_size}_rank_{self.rank}.pt")
-                local_optim_path = copy_to_local(remote_optim_path)
-                optimizer_state_dict = torch.load(local_optim_path, weights_only=False)
-                self.optimizer.load_state_dict(optimizer_state_dict)
+                if nvme_optimizer:
+                    if is_non_local(remote_optim_path):
+                        raise ValueError("NVMe optimizer checkpoints currently require a local filesystem path")
+                    local_optim_path = remote_optim_path
+                    self.optimizer.load_nvme_checkpoint(local_optim_path)
+                else:
+                    local_optim_path = copy_to_local(remote_optim_path)
+                    optimizer_state_dict = torch.load(local_optim_path, weights_only=False)
+                    self.optimizer.load_state_dict(optimizer_state_dict)
                 log_with_rank(f"Loaded optimizer from {remote_optim_path}", rank=self.rank, logger=logger)
+
+        if nvme_optimizer and self.should_load_model and not self.should_load_optimizer:
+            self.optimizer.reset_nvme_state()
 
         if self.should_load_extra:
             remote_extra_state_path = os.path.join(
@@ -235,8 +249,11 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                     log_with_rank(f"Saved model to {os.path.abspath(model_path)}", rank=self.rank, logger=logger)
 
                 if self.should_save_optimizer:
-                    optimizer_state_dict = self.optimizer.state_dict()
-                    torch.save(optimizer_state_dict, optim_path)
+                    if _uses_nvme_optimizer_checkpoint(self.optimizer):
+                        self.optimizer.save_nvme_checkpoint(optim_path)
+                    else:
+                        optimizer_state_dict = self.optimizer.state_dict()
+                        torch.save(optimizer_state_dict, optim_path)
                     log_with_rank(f"Saved optim to {os.path.abspath(optim_path)}", rank=self.rank, logger=logger)
 
                 if self.should_save_extra:

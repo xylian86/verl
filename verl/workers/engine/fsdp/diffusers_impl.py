@@ -369,6 +369,9 @@ class DiffusersFSDPEngine(BaseEngine):
         return lr_scheduler
 
     def _build_model_optimizer(self):
+        if self.engine_config.nvme_offload.enabled:
+            raise NotImplementedError("NVMe optimizer offload currently supports transformer FSDP2 engines only")
+
         from verl.utils.model import print_model_size
 
         # Load base model with specified configuration and dtype

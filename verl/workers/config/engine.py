@@ -36,6 +36,7 @@ __all__ = [
     "EngineRouterReplayConfig",
     "QATEngineConfig",
     "MindSpeedEngineConfig",
+    "NVMeOffloadConfig",
 ]
 
 
@@ -144,6 +145,32 @@ class QATEngineConfig(BaseConfig):
     ignore_patterns: list[str] = field(default_factory=lambda: ["lm_head", "embed_tokens", "re:.*mlp.gate$"])
     activation_observer: str = "static_minmax"
     quantization_config_path: Optional[str] = None
+
+
+@dataclass
+class NVMeOffloadConfig(BaseConfig):
+    """Configuration for rank-local, chunked FSDP2 optimizer offload."""
+
+    enabled: bool = False
+    path: Optional[str] = None
+    offload_gradients: bool = True
+    offload_optimizer: bool = True
+    chunk_size_mb: int = 256
+    state_dtype: str = "fp32"
+    master_weights: bool = True
+    fsync: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.enabled:
+            return
+        if not self.path:
+            raise ValueError("nvme_offload.path must be set when NVMe offload is enabled")
+        if not self.offload_optimizer:
+            raise ValueError("nvme_offload.offload_optimizer=false is not supported yet")
+        if self.chunk_size_mb <= 0:
+            raise ValueError("nvme_offload.chunk_size_mb must be greater than zero")
+        if self.state_dtype.lower() not in {"fp32", "float32", "torch.float32"}:
+            raise ValueError("nvme_offload.state_dtype currently supports only fp32")
 
 
 @dataclass
@@ -257,10 +284,16 @@ class FSDPEngineConfig(EngineConfig):
     entropy_checkpointing: bool = False
     strategy: str = "fsdp"
     qat: QATEngineConfig = field(default_factory=QATEngineConfig)
+    nvme_offload: NVMeOffloadConfig = field(default_factory=NVMeOffloadConfig)
 
     def __post_init__(self):
         super().__post_init__()
         assert self.strategy in ["fsdp", "fsdp2"], f"strategy {self.strategy} not supported"
+        if self.nvme_offload.enabled:
+            if self.optimizer_offload:
+                raise ValueError("nvme_offload is mutually exclusive with optimizer_offload")
+            if self.offload_policy:
+                raise ValueError("nvme_offload is mutually exclusive with FSDP2 offload_policy")
 
 
 @dataclass

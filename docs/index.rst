@@ -114,6 +114,7 @@ verl is fast with:
    :caption: Adding new models
 
    advance/fsdp_extension
+   advance/fsdp2_nvme_offload
    advance/megatron_extension
 
 .. toctree::

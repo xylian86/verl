@@ -14,7 +14,7 @@
 
 import pytest
 
-from verl.workers.config.engine import FSDPEngineConfig, McoreEngineConfig
+from verl.workers.config.engine import FSDPEngineConfig, McoreEngineConfig, NVMeOffloadConfig
 
 
 class TestMcoreEngineConfig:
@@ -65,3 +65,20 @@ class TestFSDPEngineConfigCPU:
         test_policy = {"layer_class": "TransformerBlock"}
         config = FSDPEngineConfig(wrap_policy=test_policy)
         assert config.wrap_policy == test_policy
+
+    def test_nvme_offload_allows_later_actor_strategy_sync(self, tmp_path):
+        nvme_config = NVMeOffloadConfig(enabled=True, path=str(tmp_path))
+        config = FSDPEngineConfig(strategy="fsdp", nvme_offload=nvme_config)
+        assert config.nvme_offload.enabled
+
+    @pytest.mark.parametrize("conflict", ["optimizer_offload", "offload_policy"])
+    def test_nvme_offload_rejects_cpu_offload_modes(self, tmp_path, conflict):
+        nvme_config = NVMeOffloadConfig(enabled=True, path=str(tmp_path))
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            FSDPEngineConfig(strategy="fsdp2", nvme_offload=nvme_config, **{conflict: True})
+
+    def test_nvme_offload_validates_storage_settings(self):
+        with pytest.raises(ValueError, match="path"):
+            NVMeOffloadConfig(enabled=True)
+        with pytest.raises(ValueError, match="chunk_size_mb"):
+            NVMeOffloadConfig(enabled=True, path="/tmp/verl-nvme", chunk_size_mb=0)

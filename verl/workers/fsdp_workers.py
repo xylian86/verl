@@ -370,6 +370,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         assert role in ["actor", "ref"]
 
+        if fsdp_config.get("nvme_offload", {}).get("enabled", False):
+            raise NotImplementedError(
+                "NVMe optimizer offload requires the engine worker; set trainer.use_legacy_worker_impl=disable"
+            )
+
         # TiledMLP requires FSDP2 for correct gradient computation
         if use_tiled_mlp and self.config.actor.strategy == "fsdp":
             raise ValueError("TiledMLP requires FSDP2. Set `actor_rollout_ref.actor.strategy=fsdp2`.")
@@ -1398,6 +1403,11 @@ class CriticWorker(Worker, DistProfilerExtension):
 
         from verl.utils.model import load_valuehead_model, print_model_size
         from verl.utils.torch_dtypes import PrecisionType
+
+        if config.model.fsdp_config.get("nvme_offload", {}).get("enabled", False):
+            raise NotImplementedError(
+                "NVMe optimizer offload requires the engine worker; set trainer.use_legacy_worker_impl=disable"
+            )
 
         use_shm = config.model.get("use_shm", False)
         local_path = copy_to_local(config.model.path, use_shm=use_shm)

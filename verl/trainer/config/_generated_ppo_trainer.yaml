@@ -31,6 +31,16 @@ actor_rollout_ref:
       param_offload: false
       optimizer_offload: false
       offload_policy: false
+      nvme_offload:
+        _target_: verl.workers.config.NVMeOffloadConfig
+        enabled: false
+        path: null
+        offload_gradients: true
+        offload_optimizer: true
+        chunk_size_mb: 256
+        state_dtype: fp32
+        master_weights: true
+        fsync: false
       reshard_after_forward: true
       fsdp_size: -1
       forward_prefetch: false
@@ -205,6 +215,16 @@ actor_rollout_ref:
       param_offload: false
       optimizer_offload: false
       offload_policy: false
+      nvme_offload:
+        _target_: verl.workers.config.NVMeOffloadConfig
+        enabled: false
+        path: null
+        offload_gradients: true
+        offload_optimizer: true
+        chunk_size_mb: 256
+        state_dtype: fp32
+        master_weights: true
+        fsync: false
       reshard_after_forward: true
       fsdp_size: -1
       forward_prefetch: false
@@ -491,6 +511,16 @@ critic:
     param_offload: false
     optimizer_offload: false
     offload_policy: false
+    nvme_offload:
+      _target_: verl.workers.config.NVMeOffloadConfig
+      enabled: false
+      path: null
+      offload_gradients: true
+      offload_optimizer: true
+      chunk_size_mb: 256
+      state_dtype: fp32
+      master_weights: true
+      fsync: false
     reshard_after_forward: true
     fsdp_size: -1
     forward_prefetch: false
